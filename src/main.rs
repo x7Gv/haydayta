@@ -3,22 +3,16 @@ mod parsers;
 
 use crate::domain::{DependencyGraph, Registry, Scenario, Source, SourceId};
 use crate::parsers::{needs, source_id, time, TimeUnit};
-use crate::solvers::scheduler::{generate_jobs, Scheduler};
-use mediawiki::prelude::*;
-use nom::Parser;
-use parsoid::prelude::*;
+use crate::solvers::scheduler::{generate_jobs, Job, Scheduler};
 use petgraph::prelude::*;
 use scraper::Selector;
 use std::collections::HashMap;
 use std::time::Duration;
 use tabular::{Row, Table};
-use url::Url;
 
 pub mod domain {
-    use good_lp::{constraint, default_solver, variable, variables, Expression, Solution, SolverModel};
-    use petgraph::graph::{IndexType, NodeIndex};
+    use petgraph::graph::NodeIndex;
     use petgraph::prelude::EdgeRef;
-    use petgraph::visit::Walker;
     use petgraph::Graph;
     use std::collections::{HashMap, HashSet};
     use std::fmt::Display;
@@ -84,10 +78,10 @@ pub mod domain {
 
     #[derive(Debug, Clone)]
     pub struct Scenario<'a> {
-        registry: &'a Registry,
-        level: u64,
-        enabled_sources: HashSet<SourceId>,
-        target_goods: HashSet<GoodId>,
+        pub registry: &'a Registry,
+        pub level: u64,
+        pub enabled_sources: HashSet<SourceId>,
+        pub target_goods: HashSet<GoodId>,
     }
 
     impl<'a> Scenario<'a> {
@@ -244,7 +238,7 @@ pub mod domain {
                 .collect::<Vec<_>>()
         }
     }
-    
+
 }
 
 #[derive(Debug, Clone)]
@@ -258,114 +252,44 @@ struct RawGood {
     source: String,
 }
 
-async fn fetch_category_members(api: &mediawiki::Api, category: &str) -> Option<Vec<String>> {
-    let query = ActionApiList::categorymembers()
-        .cmtitle(format!("Category:{}", category))
-        .cmlimit(200)
-        .run(&api)
-        .await
-        .ok()?;
-
-    query["query"]["categorymembers"].as_array().map(|arr| {
-        arr.iter()
-            .flat_map(|val| {
-                let b = val["title"].as_str();
-                b.map(String::from)
-            })
-            .collect::<Vec<_>>()
-    })
-}
-
-async fn fetch_infobox<T, F>(
-    api: &mediawiki::Api,
-    client: ParsoidClient,
-    titles: Vec<String>,
-    extractor: F,
-) -> Option<Vec<T>>
-where
-    F: Fn(String, Template) -> Option<T> + Clone,
-{
-    let tasks = titles.into_iter().map(|val| {
-        let client = client.clone();
-        let extractor = extractor.clone();
-        async move {
-            let name = val.to_string();
-
-            let code = client.get(&name).await.ok()?;
-            let template = code
-                .into_mutable()
-                .filter_templates()
-                .ok()?
-                .into_iter()
-                .find(|t| t.name() == "Template:Infobox")?;
-
-            extractor(name, template)
-        }
-    });
-
-    let results: Vec<Option<T>> = futures::future::join_all(tasks).await;
-
-    Some(results.into_iter().flatten().collect())
-}
-
-fn times_to_seconds(times: Vec<TimeUnit>) -> u64 {
-    times.into_iter().fold(0, |acc, tu| match tu {
-        TimeUnit::Seconds(t) => acc + t,
-        TimeUnit::Minutes(t) => acc + t * 60,
-        TimeUnit::Hours(t) => acc + t * 60 * 60,
-        TimeUnit::Days(t) => acc + t * 60 * 60 * 24,
-    })
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let api = Api::new("https://hayday.fandom.com/api.php").await?;
-    let client = parsoid::Client::new("https://hayday.fandom.com/rest.php", "parsoid haydata")?;
-
+async fn fetch_raw_goods(client: &parsoid::Client) -> anyhow::Result<Vec<RawGood>> {
     let markup = client.get("Goods_List").await?.html().to_string();
-
     let parsed = scraper::html::Html::parse_document(&markup);
 
     let row_selector = Selector::parse("tr").unwrap();
     let cell_selector = Selector::parse("td").unwrap();
 
-    let res = parsed
+    let goods = parsed
         .select(&row_selector)
-        .flat_map(|row| {
+        .filter_map(|row| {
             let cells: Vec<_> = row.select(&cell_selector).collect();
+            if cells.len() < 7 { return None; }
 
-            if (cells.is_empty()) {
-                return None;
-            }
-
-            let name = cells[0]
-                .text()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .trim()
-                .to_string();
-            let level = cells[1].text().collect::<Vec<_>>().join(" ").to_string();
-            let price = cells[2].text().collect::<Vec<_>>().join(" ").to_string();
-            let time = cells[3].text().collect::<Vec<_>>().join(" ").to_string();
-            let exp = cells[4].text().collect::<Vec<_>>().join(" ").to_string();
-            let needs = cells[5].text().collect::<Vec<_>>().join(" ").to_string();
-            let sources = cells[6].text().collect::<Vec<_>>().join(" ").to_string();
+            let text = |i: usize| cells[i].text().collect::<Vec<_>>().join(" ").trim().to_string();
 
             Some(RawGood {
-                title: name,
-                level,
-                price,
-                time,
-                experience: exp,
-                needs,
-                source: sources,
+                title: text(0),
+                level: text(1),
+                price: text(2),
+                time: text(3),
+                experience: text(4),
+                needs: text(5),
+                source: text(6),
             })
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    let mut good_image_uri: HashMap<String, Url> = HashMap::new();
+    Ok(goods)
+}
 
-    let res = res.clone()
+fn create_registry<F>(
+    raw_goods: Vec<RawGood>,
+    source_time: F
+) -> Registry
+where
+    F : Fn(SourceId) -> Duration,
+{
+    let res = raw_goods
         .into_iter()
         .flat_map(|result| {
             let source_id = source_id(&result.source).ok()?.1;
@@ -377,7 +301,7 @@ async fn main() -> anyhow::Result<()> {
                 xp: result.experience.parse::<domain::Experience>().ok()?,
                 source: source_id.clone(),
                 price: result.price.parse().ok()?,
-                image_url: good_image_uri.get(&result.title.clone()).cloned(),
+                image_url: None,
             };
 
             let process = domain::Process {
@@ -396,28 +320,27 @@ async fn main() -> anyhow::Result<()> {
     let machines: HashMap<SourceId, Source> = res
         .iter()
         .cloned()
-        .map(|x| (x.1.source_id.clone(), domain::Source {id: x.1.source_id, capacity: Duration::from_mins(60*6)}))
+        .map(|x| (x.1.source_id.clone(), domain::Source {id: x.1.source_id.clone(), capacity: source_time(x.1.source_id)}))
         .collect();
 
-    let registry = Registry {
+    Registry {
         goods: res.iter().cloned().map(|x| {
             let good = x.0;
-
             (good.id.clone(), good)
         })
             .collect(),
         processes: res.iter().cloned().map(|(_, p)| (p.id.clone(), p)).collect(),
         sources: machines,
-    };
+    }
+}
 
-    let scen = Scenario::new(&registry)
-        .limit_level(170)
-        .with_all_sources_filtered(|x| x.id != SourceId("Field".to_string()))
-        .with_all_products_filtered(|x| true)
-        .collect();
-
+fn build_dependency_graph(scenario: Scenario) -> Graph<String, u64> {
     let mut dag = Graph::<String, u64>::default();
     let mut node_map: HashMap<String, NodeIndex> = HashMap::new();
+
+    let scen = scenario.collect();
+
+    println!("{:#?}", scen);
 
     for x in &scen.0 {
         let product = x.product.0.0.clone();
@@ -429,66 +352,87 @@ async fn main() -> anyhow::Result<()> {
 
     for x in &scen.0 {
         let product = x.product.0.0.clone();
+        let p_idx = *node_map.entry(product.clone()).or_insert_with(|| dag.add_node(product));
 
-        if let Some(product_ix) = node_map.get(&product) {
-            let product_ix = product_ix.clone();
-
-            for y in &x.needs {
-                let need = y.0.0.clone();
-
-                if let Some(need_ix) = node_map.get(&need) {
-                    dag.add_edge(product_ix.clone(), need_ix.clone(),  y.1);
-                } else {
-                    let node_ix = dag.add_node(need.clone());
-
-                    node_map.insert(need.clone(), node_ix.clone());
-                    dag.add_edge(product_ix.clone(), node_ix.clone(), y.1);
-                }
-            }
+        for (need_id, quantity) in &x.needs {
+            let need_name = need_id.0.clone();
+            let n_idx = *node_map.entry(need_name.clone()).or_insert_with(|| dag.add_node(need_name));
+            dag.add_edge(p_idx, n_idx, *quantity);
         }
     }
+    dag
+}
 
-    let solution = solvers::planner::solve_production_plan(
-        &scen.0[..],
-        &scen.1[..],
-        &HashMap::from_iter(vec![
-            (domain::GoodId("corn".to_string()), 10),
-            (domain::GoodId("Wheat".to_string()), 40),
-            (domain::GoodId("Milk".to_string()), 30),
-            (domain::GoodId("Sugarcane".to_string()), 30),
-            (domain::GoodId("Cherry".to_string()), 20),
-        ]),
-        |proc| { proc.goods.iter().map(|x| x.price as f64).sum() },
-        HashMap::new()
-    );
-
-    println!("{:#?}", solution.clone().map(|xx| (xx.total_value, xx.counts.into_iter().map(|yy| (yy.0.0, yy.1)).filter(|z| z.1 > 0).collect::<Vec<_>>())));
-
-    let deps = DependencyGraph::with_processes(&scen.0[..]);
-
-    let jobs = generate_jobs(&registry, &deps, solution.clone().unwrap());
-
-    let schedule = Scheduler::new(jobs).solve();
-
-    let mut ress = schedule.unwrap().1;
-
-    ress.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+fn print_production_table(results: Vec<(Job, f64)>, total_value: f64) {
+    let mut sorted_res = results;
+    sorted_res.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut table = Table::new("{:>} :: {:<} :: [ {:<} ] ( {:<} )");
-
-    table.add_row(Row::new().with_cell("DELTA (secs)").with_cell("PRODUCT").with_cell("SOURCE").with_cell("CONSUMING"));
+    table.add_row(Row::new().with_cell("DELTA (s)").with_cell("PRODUCT").with_cell("SOURCE").with_cell("CONSUMING"));
     table.add_heading("----------------------------------------------------------");
 
-    for (asd, ada) in ress {
+    for (job, start_time) in sorted_res {
+        let consumes = job.consumes.iter().map(|x| x.0.to_string()).collect::<Vec<_>>();
         table.add_row(
             Row::new()
-                .with_cell(format!("{} (s)", ada.round() as u64)).with_cell(asd.job_id.0).with_cell(asd.machine_id.0).with_cell(format!("{:?}", asd.consumes.iter().map(|x| x.0.to_string()).collect::<Vec<_>>()))
+                .with_cell(format!("{}", start_time.round() as u64))
+                .with_cell(job.job_id.0)
+                .with_cell(job.machine_id.0)
+                .with_cell(format!("{:?}", consumes))
         );
     }
 
     println!("{}", table);
-    println!("---");
-    println!("{:?}", &solution.unwrap().total_value);
+    println!("---\nTotal Value: {:?}", total_value);
+}
 
-    return Ok(());
+fn times_to_seconds(times: Vec<TimeUnit>) -> u64 {
+    times.into_iter().fold(0, |acc, tu| match tu {
+        TimeUnit::Seconds(t) => acc + t,
+        TimeUnit::Minutes(t) => acc + t * 60,
+        TimeUnit::Hours(t) => acc + t * 60 * 60,
+        TimeUnit::Days(t) => acc + t * 60 * 60 * 24,
+    })
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = parsoid::Client::new("https://hayday.fandom.com/rest.php", "parsoid haydata")?;
+
+    let raw_data = fetch_raw_goods(&client).await?;
+    let registry = create_registry(raw_data, |_| Duration::from_mins(60*3));
+
+    println!("{:?}", registry.processes);
+
+    let scen = Scenario::new(&registry)
+        .limit_level(170)
+        .with_all_products_filtered(|x| true)
+        .with_all_sources_filtered(|x| x.id != SourceId("Field".to_string())).clone();
+
+    let items = scen.clone().collect();
+
+    let _dag = build_dependency_graph(scen);
+
+    let inventory = HashMap::from_iter(vec![
+        (domain::GoodId("Wheat".to_string()), 40),
+        (domain::GoodId("Cherry".to_string()), 20),
+        (domain::GoodId("Sugarcane".to_string()), 20),
+    ]);
+
+    let solution = solvers::planner::solve_production_plan(
+        &items.0,
+        &items.1,
+        &inventory,
+        |proc| proc.goods.iter().map(|x| x.price as f64).sum(),
+        HashMap::new()
+    ).unwrap();
+
+    let deps = DependencyGraph::with_processes(&items.0);
+    let jobs = generate_jobs(&registry, &deps, solution.clone());
+    let (_, results) = Scheduler::new(jobs).solve()
+        .ok_or_else(|| anyhow::anyhow!("Scheduling failed"))?;
+
+    print_production_table(results, solution.total_value);
+
+    Ok(())
 }

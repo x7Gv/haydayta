@@ -55,7 +55,6 @@ where
             })
             .sum();
 
-        // Handle requirement
         if let Some(amount) = requirements.get(&good_id) {
             model.add_constraint(constraint!(net_change.clone() <= (*amount as f64)));
         }

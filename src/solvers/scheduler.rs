@@ -137,8 +137,6 @@ impl Scheduler {
 
         let big_m: f64 = self.jobs.iter().map(|j| j.duration.as_secs_f64()).sum();
 
-        println!("big_m: {}", big_m);
-
         for ((id_a, id_b), bin_var) in ordering_vars.into_iter() {
             let start_a = start_times[&id_a];
             let start_b = start_times[&id_b];
