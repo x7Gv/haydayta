@@ -1,0 +1,25 @@
+[package]
+name = "haydayta"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+futures = "0.3.32"
+good_lp = { version = "1.15.1", features = ["highs"] }
+mediawiki = "0.5.1"
+nom = "8.0.0"
+parsoid = "0.11.0-rc.1"
+scraper = "0.26.0"
+serde = "1.0.228"
+serde_json = "1.0.149"
+tokio = { version = "1.52.1", features = ["full"] }
+clap = { version = "4.6.1", features = ["derive"] }
+highs = "2.0.0"
+petgraph = "0.8.3"
+tabular = "0.2.0"
+url = "2.5.8"
+egui = "*"
+eframe = "*"
+egui_extras = { version = "*", features = ["http", "image", "webp"] }
+image = { version = "0.24", features = ["png", "jpeg", "webp"] }
