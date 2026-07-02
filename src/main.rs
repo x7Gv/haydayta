@@ -405,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
     println!("{:?}", registry.processes);
 
     let scen = Scenario::new(&registry)
-        .limit_level(170)
+        .limit_level(39)
         .with_all_products_filtered(|x| true)
         .with_all_sources_filtered(|x| x.id != SourceId("Field".to_string())).clone();
 
